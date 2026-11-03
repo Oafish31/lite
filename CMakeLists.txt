@@ -8,6 +8,8 @@ endif()
 # runtime statis: user tidak perlu install VC++ Redistributable
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
+# dependensi lama (glew-cmake, SDL2) memakai cmake_minimum_required < 3.5; CMake 4+ menolaknya tanpa ini
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 include(FetchContent)
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 set(SDL_STATIC ON CACHE BOOL "" FORCE)

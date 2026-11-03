@@ -19,3 +19,9 @@ Tool texturing ringan (C++17, OpenGL 3.3, SDL2, Dear ImGui). Cocok untuk i3-4170
 - Node editor: klik kanan = tambah node, drag pin untuk sambung, Delete = hapus.
 - Bake: load low-poly (harus ada UV) -> load high-poly -> Bake Normal Map -> Export.
 - Saat drag slider, preview 256px lalu otomatis full-res saat dilepas (biar ringan).
+
+## Import (simple)
+- **Tab Import**: tombol *Buka model OBJ...*, *Buka Normal Map...*, *Buka Albedo...* (dialog file Windows).
+- **Drag & drop** file OBJ / PNG / JPG / TGA / BMP ke jendela -> muncul pilihan "pakai sebagai apa".
+- Normal map dari DirectX (Unity/Unreal)? Centang **Normal map DirectX (flip Y)**.
+- UI berupa tab per langkah: Import, Texture, Paint, Decal, Bake, Export. Alat (paint/decal) otomatis mengikuti tab aktif.

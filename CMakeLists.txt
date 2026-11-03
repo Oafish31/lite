@@ -37,9 +37,12 @@ add_library(imgui_lib STATIC
 target_include_directories(imgui_lib PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends ${imnodes_SOURCE_DIR})
 target_link_libraries(imgui_lib PUBLIC SDL2::SDL2-static)
 
-add_executable(LiteTex src/main.cpp)
+add_executable(LiteTex src/main.cpp src/fileutil.cpp)
 target_include_directories(LiteTex PRIVATE ${stb_SOURCE_DIR})
 target_link_libraries(LiteTex PRIVATE imgui_lib SDL2::SDL2-static libglew_static glm::glm Threads::Threads)
+if(WIN32)
+  target_link_libraries(LiteTex PRIVATE comdlg32 shell32 ole32)
+endif()
 if(MSVC)
   target_compile_options(LiteTex PRIVATE /O2 /utf-8)
 endif()

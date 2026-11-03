@@ -17,6 +17,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <cctype>
+#include "fileutil.h"
 #include "nodes.h"
 #include "mesh.h"
 
@@ -38,7 +40,12 @@ static std::vector<uint8_t> albedoPx, roughPx, normalPx;
 static int curRes = 0;
 static std::vector<uint8_t> bakedNormal, bakedAO;
 static int bakedNRes = 0, bakedAORes = 0;
-static bool useBaked = false, useAO = false;
+static bool useAO = false;
+struct ImgTex { int w = 0, h = 0; std::vector<uint8_t> px; bool ok() const { return !px.empty(); } };
+static ImgTex impNormal, impAlbedo;     // texture hasil import file
+static int normalSrc = 0;               // 0 = node, 1 = hasil bake, 2 = file import
+static int albedoSrc = 0;               // 0 = node, 1 = file import
+static bool flipY = false;
 
 static const int PRES = 1024;
 static std::vector<uint8_t> paintPx((size_t)PRES * PRES * 4, 0);
@@ -122,8 +129,13 @@ static void setLowMesh(Mesh&& m) {
 
 // ===================== tekstur dari node =====================
 static void applyNormalTex() {
-  if (useBaked && !bakedNormal.empty()) uploadTex(texNormal, bakedNRes, bakedNRes, bakedNormal.data(), true);
+  if (normalSrc == 2 && impNormal.ok()) uploadTex(texNormal, impNormal.w, impNormal.h, impNormal.px.data(), true);
+  else if (normalSrc == 1 && !bakedNormal.empty()) uploadTex(texNormal, bakedNRes, bakedNRes, bakedNormal.data(), true);
   else if (!normalPx.empty()) uploadTex(texNormal, curRes, curRes, normalPx.data(), true);
+}
+static void applyAlbedoTex() {
+  if (albedoSrc == 1 && impAlbedo.ok()) uploadTex(texAlbedo, impAlbedo.w, impAlbedo.h, impAlbedo.px.data(), true);
+  else if (!albedoPx.empty()) uploadTex(texAlbedo, curRes, curRes, albedoPx.data(), true);
 }
 static void regenMaps(int res) {
   Evaluator ev; ev.prepare(graph); curRes = res;
@@ -140,7 +152,7 @@ static void regenMaps(int res) {
     }
   });
   heightToNormal(heightMap, res, normStrength, normalPx);
-  uploadTex(texAlbedo, res, res, albedoPx.data(), true);
+  applyAlbedoTex();
   uploadTex(texRough, res, res, roughPx.data(), false);
   applyNormalTex();
 }
@@ -218,7 +230,7 @@ static std::vector<uint8_t> decalPx((size_t)PRES * PRES * 4, 128);   // layer: r
 static int ddy0 = PRES, ddy1 = -1; static bool decalUsed = false;
 static std::vector<std::vector<uint8_t>> decalUndo;
 static float decalSize = 0.08f, decalRot = 0.f, decalStrength = 1.f, decalOpac = 1.f; static bool decalInvert = false, decalRandom = false;
-static char decalPath[512] = ""; static bool decalIsNormal = true;
+static char decalPath[512] = ""; static int decalIsNormal = 1;
 
 static float ssf(float a, float b, float x) { float t = glm::clamp((x - a) / (b - a), 0.f, 1.f); return t * t * (3 - 2 * t); }
 
@@ -388,7 +400,7 @@ static void bakeNormal() {
     glm::vec3 q = glm::normalize(glm::vec3(glm::dot(hn, t), glm::dot(hn, b), glm::dot(hn, n))) * 0.5f + 0.5f;
     for (int k = 0; k < 3; k++) o[k] = (uint8_t)(glm::clamp(q[k], 0.f, 1.f) * 255.f + .5f);
   }, bakedNormal);
-  bakedNRes = res; useBaked = true; applyNormalTex();
+  bakedNRes = res; normalSrc = 1; applyNormalTex();
   double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   status = "Bake normal selesai (" + std::to_string(res) + "px, " + std::to_string(s).substr(0, 4) + "s)";
 }
@@ -422,35 +434,41 @@ static bool writePNG(const std::string& path, int w, int h, const uint8_t* d) {
   return stbi_write_png(path.c_str(), w, h, 4, d, w * 4) != 0;
 }
 static bool exportNormal(const std::string& dir) {
-  bool baked = useBaked && !bakedNormal.empty();
-  const std::vector<uint8_t>& base = baked ? bakedNormal : normalPx; int rb = baked ? bakedNRes : curRes;
-  if (!decalUsed) return writePNG(dir + "/normal.png", rb, rb, base.data());
-  int R = std::max(rb, PRES); std::vector<uint8_t> out((size_t)R * R * 4, 255);
-  parallelFor(R, [&](int y) {
-    for (int x = 0; x < R; x++) {
-      size_t bi = ((size_t)(y * rb / R) * rb + (x * rb / R)) * 4, di = ((size_t)(y * PRES / R) * PRES + (x * PRES / R)) * 4, o = ((size_t)y * R + x) * 4;
+  const uint8_t* base = normalPx.data(); int bw = curRes, bh = curRes;
+  if (normalSrc == 2 && impNormal.ok()) { base = impNormal.px.data(); bw = impNormal.w; bh = impNormal.h; }
+  else if (normalSrc == 1 && !bakedNormal.empty()) { base = bakedNormal.data(); bw = bh = bakedNRes; }
+  if (!decalUsed) return writePNG(dir + "/normal.png", bw, bh, base);
+  int W = std::max(bw, PRES), H = std::max(bh, PRES); std::vector<uint8_t> out((size_t)W * H * 4, 255);
+  parallelFor(H, [&](int y) {
+    for (int x = 0; x < W; x++) {
+      size_t bi = ((size_t)(y * bh / H) * bw + (x * bw / W)) * 4, di = ((size_t)(y * PRES / H) * PRES + (x * PRES / W)) * 4, o = ((size_t)y * W + x) * 4;
       glm::vec3 n(base[bi] / 127.5f - 1.f + (decalPx[di] - 128) / 127.f, base[bi + 1] / 127.5f - 1.f + (decalPx[di + 1] - 128) / 127.f, base[bi + 2] / 127.5f - 1.f);
       n = glm::normalize(n) * 0.5f + 0.5f;
       for (int k = 0; k < 3; k++) out[o + k] = (uint8_t)(glm::clamp(n[k], 0.f, 1.f) * 255.f + .5f);
     }
   });
-  return writePNG(dir + "/normal.png", R, R, out.data());
+  return writePNG(dir + "/normal.png", W, H, out.data());
 }
 static void exportAll(const std::string& dir) {
   namespace fs = std::filesystem;
   std::error_code ec; fs::create_directories(dir, ec);
   regenMaps(resOpts[texResIdx]); dirty = false;
   int r = curRes;
-  std::vector<uint8_t> alb((size_t)PRES * PRES * 4);
-  for (int y = 0; y < PRES; y++) for (int x = 0; x < PRES; x++) {
-    size_t bi = ((size_t)(y * r / PRES) * r + (x * r / PRES)) * 4, pi = ((size_t)y * PRES + x) * 4;
-    float a = paintPx[pi + 3] / 255.f;
-    for (int k = 0; k < 3; k++) alb[pi + k] = (uint8_t)(albedoPx[bi + k] * (1 - a) + paintPx[pi + k] * a + .5f);
-    alb[pi + 3] = 255;
-  }
+  bool ia = albedoSrc == 1 && impAlbedo.ok();
+  const uint8_t* ab = ia ? impAlbedo.px.data() : albedoPx.data(); int aw = ia ? impAlbedo.w : r, ah = ia ? impAlbedo.h : r;
+  int OW = std::max(aw, PRES), OH = std::max(ah, PRES);
+  std::vector<uint8_t> alb((size_t)OW * OH * 4);
+  parallelFor(OH, [&](int y) {
+    for (int x = 0; x < OW; x++) {
+      size_t bi = ((size_t)(y * ah / OH) * aw + (x * aw / OW)) * 4, pi = ((size_t)(y * PRES / OH) * PRES + (x * PRES / OW)) * 4, o = ((size_t)y * OW + x) * 4;
+      float a = paintPx[pi + 3] / 255.f;
+      for (int k = 0; k < 3; k++) alb[o + k] = (uint8_t)(ab[bi + k] * (1 - a) + paintPx[pi + k] * a + .5f);
+      alb[o + 3] = 255;
+    }
+  });
   std::vector<uint8_t> hp((size_t)r * r * 4, 255);
   for (size_t i = 0; i < (size_t)r * r; i++) hp[i * 4] = hp[i * 4 + 1] = hp[i * 4 + 2] = (uint8_t)(glm::clamp(heightMap[i], 0.f, 1.f) * 255.f + .5f);
-  bool ok = writePNG(dir + "/albedo.png", PRES, PRES, alb.data());
+  bool ok = writePNG(dir + "/albedo.png", OW, OH, alb.data());
   ok &= writePNG(dir + "/roughness.png", r, r, roughPx.data());
   ok &= writePNG(dir + "/height.png", r, r, hp.data());
   ok &= exportNormal(dir);
@@ -533,76 +551,201 @@ static void nodeEditorUI(bool& open) {
   ImGui::End();
 }
 
-static int modelIdx = 0, viewMode = 0; static bool wire = false, showNodes = true;
-static char lowPath[512] = "", highPath[512] = "", exportDir[512] = "export";
+// ===================== import & UI =====================
+static int viewMode = 0; static bool wire = false, showNodes = true; static char exportDir[512] = "export";
+static std::string lowName = "Sphere", highName, impNormalName, impAlbedoName;
+static bool dropOpen = false; static std::string dropPath;
+static const char* FILT_OBJ = "Model OBJ\0*.obj\0Semua file\0*.*\0";
+static const char* FILT_IMG = "Gambar\0*.png;*.jpg;*.jpeg;*.tga;*.bmp\0Semua file\0*.*\0";
+
+static std::string fileNameOf(const std::string& p) { return std::filesystem::path(p).filename().string(); }
+static std::string extOf(const std::string& p) {
+  std::string e = std::filesystem::path(p).extension().string();
+  for (auto& c : e) c = (char)std::tolower((unsigned char)c);
+  return e;
+}
+static bool browse(const char* filter, std::string& out) {
+  if (!fileDialogSupported()) { status = "Dialog file hanya ada di Windows. Pakai drag & drop."; return false; }
+  return pickOpenFile(filter, out);
+}
+static void resetForNewModel() {
+  std::fill(paintPx.begin(), paintPx.end(), 0); pdy0 = 0; pdy1 = PRES - 1; lastValid = false;
+  clearDecals();
+  bakedNormal.clear(); bakedAO.clear(); useAO = false;
+  uint8_t w[4] = {255, 255, 255, 255}; uploadTex(texAO, 1, 1, w, false);
+  if (normalSrc == 1) normalSrc = 0;
+  applyNormalTex();
+}
+static void useModel(Mesh&& m, const std::string& name) { setLowMesh(std::move(m)); lowName = name; resetForNewModel(); }
+static void loadLow(const std::string& p) {
+  Mesh m; std::string err;
+  if (!loadOBJ(p, m, err)) { status = err; return; }
+  bool uv = m.hasUV; size_t t = m.tris(); useModel(std::move(m), fileNameOf(p));
+  status = "Model dimuat: " + std::to_string(t) + " tris" + (uv ? "" : " (TANPA UV, tidak bisa paint/bake)");
+}
+static void loadHigh(const std::string& p) {
+  Mesh m; std::string err;
+  if (!loadOBJ(p, m, err)) { status = err; return; }
+  highMesh = std::move(m); highBvh.build(highMesh); hasHigh = true; highName = fileNameOf(p);
+  status = "High-poly dimuat: " + std::to_string(highMesh.tris()) + " tris";
+}
+static bool loadImg(const std::string& path, ImgTex& t, std::string& err) {
+  int w, h, c; stbi_set_flip_vertically_on_load(1);
+  unsigned char* p = stbi_load(path.c_str(), &w, &h, &c, 4); stbi_set_flip_vertically_on_load(0);
+  if (!p) { err = "Gagal membuka gambar: " + path; return false; }
+  t.w = w; t.h = h; t.px.assign(p, p + (size_t)w * h * 4); stbi_image_free(p);
+  for (size_t i = 0; i < (size_t)w * h; i++) t.px[i * 4 + 3] = 255;
+  return true;
+}
+static void flipGreen(ImgTex& t) { for (size_t i = 0; i < (size_t)t.w * t.h; i++) t.px[i * 4 + 1] = 255 - t.px[i * 4 + 1]; }
+static void importNormal(const std::string& p) {
+  std::string err; ImgTex t;
+  if (!loadImg(p, t, err)) { status = err; return; }
+  if (flipY) flipGreen(t);
+  impNormal = std::move(t); impNormalName = fileNameOf(p); normalSrc = 2; applyNormalTex();
+  status = "Normal map dipakai: " + impNormalName + (flipY ? " (flip Y)" : "");
+}
+static void importAlbedo(const std::string& p) {
+  std::string err; ImgTex t;
+  if (!loadImg(p, t, err)) { status = err; return; }
+  impAlbedo = std::move(t); impAlbedoName = fileNameOf(p); albedoSrc = 1; applyAlbedoTex();
+  status = "Albedo dipakai: " + impAlbedoName;
+}
+static void importDecal(const std::string& p, bool isNormal) {
+  std::string err;
+  if (loadDecalPNG(p.c_str(), isNormal, err)) { decalSel = (int)decals.size() - 1; status = "Decal dimuat: " + decals.back().name; }
+  else status = err;
+}
+
+// popup setelah drag & drop: tanya file ini mau dipakai sebagai apa
+static void dropPopupUI() {
+  if (dropOpen) { ImGui::OpenPopup("Import file"); dropOpen = false; }
+  ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+  if (!ImGui::BeginPopupModal("Import file", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
+  ImGui::Text("%s", fileNameOf(dropPath).c_str()); ImGui::Separator(); ImGui::TextUnformatted("Pakai sebagai:");
+  std::string ext = extOf(dropPath); const ImVec2 bs(280, 0); bool close = false;
+  if (ext == ".obj") {
+    if (ImGui::Button("Model utama (low-poly)", bs)) { loadLow(dropPath); close = true; }
+    if (ImGui::Button("High-poly (untuk bake)", bs)) { loadHigh(dropPath); close = true; }
+  } else if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tga" || ext == ".bmp") {
+    if (ImGui::Button("Normal map utama", bs)) { importNormal(dropPath); close = true; }
+    if (ImGui::Button("Albedo / Base color", bs)) { importAlbedo(dropPath); close = true; }
+    if (ImGui::Button("Decal (normal map)", bs)) { importDecal(dropPath, true); close = true; }
+    if (ImGui::Button("Decal (height / grayscale)", bs)) { importDecal(dropPath, false); close = true; }
+  } else ImGui::TextUnformatted("Format tidak didukung (OBJ, PNG, JPG, TGA, BMP)");
+  if (ImGui::Button("Batal", bs)) close = true;
+  if (close) ImGui::CloseCurrentPopup();
+  ImGui::EndPopup();
+}
 
 static void toolsUI() {
-  ImGui::SetNextWindowPos(ImVec2(940, 10), ImGuiCond_FirstUseEver); ImGui::SetNextWindowSize(ImVec2(320, 700), ImGuiCond_FirstUseEver);
-  ImGui::Begin("Tools");
-  ImGui::Combo("Tool (LMB)", &tool, "Off\0Paint\0Normal Decal\0");
-  if (ImGui::CollapsingHeader("Model & View", ImGuiTreeNodeFlags_DefaultOpen)) {
-    if (ImGui::Combo("Model", &modelIdx, "Sphere\0Cube\0Plane\0Custom OBJ\0")) {
-      if (modelIdx == 0) setLowMesh(makeSphere()); else if (modelIdx == 1) setLowMesh(makeCube()); else if (modelIdx == 2) setLowMesh(makePlane());
+  ImGui::SetNextWindowPos(ImVec2(940, 10), ImGuiCond_FirstUseEver); ImGui::SetNextWindowSize(ImVec2(330, 700), ImGuiCond_FirstUseEver);
+  ImGui::Begin("LiteTex");
+  int newTool = 0; std::string p;
+  ImGui::SetNextItemWidth(110); ImGui::Combo("##view", &viewMode, "Lit\0Albedo\0Normal\0AO\0");
+  ImGui::SameLine(); ImGui::Checkbox("Wire", &wire); ImGui::SameLine(); ImGui::Checkbox("Node Editor", &showNodes);
+  ImGui::TextDisabled("Kamera: klik kanan putar | tengah geser | scroll zoom");
+  if (ImGui::BeginTabBar("tabs")) {
+    // ---------------- Import ----------------
+    if (ImGui::BeginTabItem("Import")) {
+      ImGui::SeparatorText("Model");
+      if (ImGui::Button("Sphere")) useModel(makeSphere(), "Sphere"); ImGui::SameLine();
+      if (ImGui::Button("Cube")) useModel(makeCube(), "Cube"); ImGui::SameLine();
+      if (ImGui::Button("Plane")) useModel(makePlane(), "Plane");
+      if (ImGui::Button("Buka model OBJ...", ImVec2(-1, 0)) && browse(FILT_OBJ, p)) loadLow(p);
+      ImGui::Text("Aktif: %s (%d tris)%s", lowName.c_str(), (int)lowMesh.tris(), lowMesh.hasUV ? "" : "  [tanpa UV]");
+      ImGui::SeparatorText("Texture");
+      if (ImGui::Checkbox("Normal map DirectX (flip Y)", &flipY) && impNormal.ok()) { flipGreen(impNormal); applyNormalTex(); }
+      if (ImGui::Button("Buka Normal Map...", ImVec2(-1, 0)) && browse(FILT_IMG, p)) importNormal(p);
+      if (impNormal.ok()) {
+        ImGui::Text("Normal: %s", impNormalName.c_str()); ImGui::SameLine();
+        if (ImGui::SmallButton("Hapus##n")) { impNormal = ImgTex(); if (normalSrc == 2) normalSrc = 0; applyNormalTex(); }
+      }
+      if (ImGui::Button("Buka Albedo / Base Color...", ImVec2(-1, 0)) && browse(FILT_IMG, p)) importAlbedo(p);
+      if (impAlbedo.ok()) {
+        ImGui::Text("Albedo: %s", impAlbedoName.c_str()); ImGui::SameLine();
+        if (ImGui::SmallButton("Hapus##a")) { impAlbedo = ImgTex(); if (albedoSrc == 1) albedoSrc = 0; applyAlbedoTex(); }
+      }
+      ImGui::Spacing(); ImGui::TextWrapped("Tips: drag & drop file OBJ / PNG / JPG langsung ke jendela, nanti ditanya mau dipakai sebagai apa.");
+      ImGui::TextDisabled("Ganti model = paint, decal & bake di-reset.");
+      ImGui::EndTabItem();
     }
-    ImGui::InputText("Low-poly .obj", lowPath, sizeof(lowPath));
-    if (ImGui::Button("Load low-poly")) {
-      Mesh m; std::string err;
-      if (loadOBJ(lowPath, m, err)) { setLowMesh(std::move(m)); modelIdx = 3; status = "Low-poly dimuat: " + std::to_string(lowMesh.tris()) + " tris" + (lowMesh.hasUV ? "" : " (TANPA UV!)"); }
-      else status = err;
+    // ---------------- Texture ----------------
+    if (ImGui::BeginTabItem("Texture")) {
+      ImGui::TextWrapped("Atur texture lewat Node Editor (klik kanan = tambah node).");
+      if (ImGui::Combo("Resolusi", &texResIdx, "256\0" "512\0" "1024\0" "2048\0")) dirty = true;
+      if (ImGui::SliderFloat("Normal strength", &normStrength, 0.f, 30.f)) dirty = true;
+      ImGui::SeparatorText("Sumber map di model");
+      if (ImGui::Combo("Normal", &normalSrc, "Dari Node\0Hasil Bake\0File Import\0")) applyNormalTex();
+      if (ImGui::Combo("Albedo", &albedoSrc, "Dari Node\0File Import\0")) applyAlbedoTex();
+      ImGui::TextDisabled("Kalau sumber belum ada, otomatis pakai Node.");
+      ImGui::EndTabItem();
     }
-    ImGui::Combo("View", &viewMode, "Lit\0Albedo\0Normal\0AO\0"); ImGui::Checkbox("Wireframe", &wire);
-    ImGui::Checkbox("Tampilkan Node Editor", &showNodes);
-    ImGui::TextDisabled("RMB orbit | MMB geser | scroll zoom");
-  }
-  if (ImGui::CollapsingHeader("Texture (Node)", ImGuiTreeNodeFlags_DefaultOpen)) {
-    if (ImGui::Combo("Resolusi", &texResIdx, "256\0" "512\0" "1024\0" "2048\0")) dirty = true;
-    if (ImGui::SliderFloat("Normal strength", &normStrength, 0.f, 30.f)) dirty = true;
-  }
-  if (ImGui::CollapsingHeader("Paint", ImGuiTreeNodeFlags_DefaultOpen)) {
-    ImGui::Checkbox("Eraser", &eraser);
-    ImGui::ColorEdit3("Warna", glm::value_ptr(brushCol), ImGuiColorEditFlags_NoInputs);
-    ImGui::SliderFloat("Ukuran", &brushSize, 2.f, 120.f); ImGui::SliderFloat("Hardness", &brushHard, 0.f, 0.99f); ImGui::SliderFloat("Opacity", &brushOpac, 0.05f, 1.f);
-    if (ImGui::Button("Hapus semua paint")) { std::fill(paintPx.begin(), paintPx.end(), 0); pdy0 = 0; pdy1 = PRES - 1; }
-  }
-  if (ImGui::CollapsingHeader("Normal Decal", ImGuiTreeNodeFlags_DefaultOpen)) {
-    ImGui::TextDisabled("Tool = Normal Decal, klik di model. Q/E putar, Ctrl+Z undo");
-    for (int i = 0; i < (int)decals.size(); i++) {
-      if (i % 4) ImGui::SameLine();
-      ImGui::PushID(i); bool sel = i == decalSel;
-      if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.9f, 0.6f, 0.1f, 1));
-      if (ImGui::ImageButton("##d", (ImTextureID)(intptr_t)decals[i].thumb, ImVec2(56, 56))) { decalSel = i; tool = 2; }
-      if (sel) ImGui::PopStyleColor();
-      if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", decals[i].name.c_str());
-      ImGui::PopID();
+    // ---------------- Paint ----------------
+    if (ImGui::BeginTabItem("Paint")) {
+      newTool = 1;
+      ImGui::TextWrapped("Klik kiri di model untuk melukis.");
+      ImGui::Checkbox("Eraser", &eraser);
+      ImGui::ColorEdit3("Warna", glm::value_ptr(brushCol), ImGuiColorEditFlags_NoInputs);
+      ImGui::SliderFloat("Ukuran", &brushSize, 2.f, 120.f); ImGui::SliderFloat("Hardness", &brushHard, 0.f, 0.99f); ImGui::SliderFloat("Opacity", &brushOpac, 0.05f, 1.f);
+      if (ImGui::Button("Hapus semua paint")) { std::fill(paintPx.begin(), paintPx.end(), 0); pdy0 = 0; pdy1 = PRES - 1; }
+      ImGui::EndTabItem();
     }
-    ImGui::SliderFloat("Ukuran", &decalSize, 0.005f, 0.4f, "%.3f"); ImGui::SliderFloat("Rotasi", &decalRot, -180.f, 180.f);
-    ImGui::SliderFloat("Kekuatan", &decalStrength, 0.f, 3.f); ImGui::SliderFloat("Opacity##d", &decalOpac, 0.05f, 1.f);
-    ImGui::Checkbox("Inverse (cekung/cembung)", &decalInvert); ImGui::Checkbox("Rotasi acak", &decalRandom);
-    if (ImGui::Button("Undo decal")) undoDecal(); ImGui::SameLine(); if (ImGui::Button("Hapus semua decal")) clearDecals();
-    ImGui::InputText("Decal .png", decalPath, sizeof(decalPath)); ImGui::Checkbox("PNG = normal map (off = height/grayscale)", &decalIsNormal);
-    if (ImGui::Button("Load PNG decal")) { std::string err; if (loadDecalPNG(decalPath, decalIsNormal, err)) { decalSel = (int)decals.size() - 1; tool = 2; status = "Decal dimuat: " + decals.back().name; } else status = err; }
-  }
-  if (ImGui::CollapsingHeader("Bake (High -> Low)", ImGuiTreeNodeFlags_DefaultOpen)) {
-    ImGui::InputText("High-poly .obj", highPath, sizeof(highPath));
-    if (ImGui::Button("Load high-poly")) {
-      Mesh m; std::string err;
-      if (loadOBJ(highPath, m, err)) { highMesh = std::move(m); highBvh.build(highMesh); hasHigh = true; status = "High-poly dimuat: " + std::to_string(highMesh.tris()) + " tris"; }
-      else status = err;
+    // ---------------- Decal ----------------
+    if (ImGui::BeginTabItem("Decal")) {
+      newTool = 2;
+      ImGui::TextWrapped("Pilih decal, lalu klik di model. Q/E putar, Ctrl+Z undo.");
+      for (int i = 0; i < (int)decals.size(); i++) {
+        if (i % 4) ImGui::SameLine();
+        ImGui::PushID(i); bool sel = i == decalSel;
+        if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.9f, 0.6f, 0.1f, 1));
+        if (ImGui::ImageButton("##d", (ImTextureID)(intptr_t)decals[i].thumb, ImVec2(56, 56))) decalSel = i;
+        if (sel) ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", decals[i].name.c_str());
+        ImGui::PopID();
+      }
+      ImGui::SliderFloat("Ukuran", &decalSize, 0.005f, 0.4f, "%.3f"); ImGui::SliderFloat("Rotasi", &decalRot, -180.f, 180.f);
+      ImGui::SliderFloat("Kekuatan", &decalStrength, 0.f, 3.f); ImGui::SliderFloat("Opacity##d", &decalOpac, 0.05f, 1.f);
+      ImGui::Checkbox("Inverse", &decalInvert); ImGui::SameLine(); ImGui::Checkbox("Rotasi acak", &decalRandom);
+      if (ImGui::Button("Undo")) undoDecal(); ImGui::SameLine(); if (ImGui::Button("Hapus semua decal")) clearDecals();
+      ImGui::SeparatorText("Decal sendiri");
+      ImGui::RadioButton("Normal map", &decalIsNormal, 1); ImGui::SameLine(); ImGui::RadioButton("Height/grayscale", &decalIsNormal, 0);
+      if (ImGui::Button("Buka PNG decal...", ImVec2(-1, 0)) && browse(FILT_IMG, p)) importDecal(p, decalIsNormal != 0);
+      ImGui::EndTabItem();
     }
-    ImGui::Combo("Bake res", &bakeResIdx, "256\0" "512\0" "1024\0" "2048\0");
-    ImGui::SliderFloat("Cage (x ukuran)", &cageRel, 0.005f, 0.3f);
-    if (ImGui::Button("Bake Normal Map")) bakeNormal();
-    ImGui::SameLine(); if (ImGui::Checkbox("Pakai hasil bake", &useBaked)) applyNormalTex();
-    ImGui::SliderFloat("AO jarak", &aoDistRel, 0.01f, 0.6f); ImGui::SliderInt("AO sample", &aoSamples, 4, 64);
-    if (ImGui::Button("Bake AO")) bakeAO();
-    ImGui::SameLine(); ImGui::Checkbox("Pakai AO", &useAO);
+    // ---------------- Bake ----------------
+    if (ImGui::BeginTabItem("Bake")) {
+      ImGui::TextWrapped("1) Model aktif = low-poly (harus punya UV)  2) Buka high-poly  3) Bake.");
+      if (ImGui::Button("Buka High-poly OBJ...", ImVec2(-1, 0)) && browse(FILT_OBJ, p)) loadHigh(p);
+      if (hasHigh) {
+        ImGui::Text("High: %s (%d tris)", highName.c_str(), (int)highMesh.tris()); ImGui::SameLine();
+        if (ImGui::SmallButton("Hapus##h")) { hasHigh = false; highMesh = Mesh(); highName.clear(); }
+      } else ImGui::TextDisabled("High-poly belum dimuat");
+      ImGui::Combo("Resolusi bake", &bakeResIdx, "256\0" "512\0" "1024\0" "2048\0");
+      ImGui::SeparatorText("Normal map");
+      ImGui::SliderFloat("Cage", &cageRel, 0.005f, 0.3f);
+      if (ImGui::Button("Bake Normal Map", ImVec2(-1, 0))) bakeNormal();
+      ImGui::SeparatorText("Ambient Occlusion");
+      ImGui::SliderFloat("Jarak", &aoDistRel, 0.01f, 0.6f); ImGui::SliderInt("Sample", &aoSamples, 4, 64);
+      if (ImGui::Button("Bake AO", ImVec2(-1, 0))) bakeAO();
+      ImGui::Checkbox("Pakai AO di model", &useAO);
+      ImGui::EndTabItem();
+    }
+    // ---------------- Export ----------------
+    if (ImGui::BeginTabItem("Export")) {
+      ImGui::TextWrapped("Simpan albedo (+paint), normal (+bake/decal), roughness, height, ao sebagai PNG.");
+      ImGui::InputText("Folder", exportDir, sizeof(exportDir));
+      if (ImGui::Button("Pilih folder...", ImVec2(-1, 0))) {
+        std::string d; if (!fileDialogSupported()) status = "Dialog folder hanya ada di Windows. Ketik nama folder."; else if (pickFolder(d)) std::snprintf(exportDir, sizeof(exportDir), "%s", d.c_str());
+      }
+      if (ImGui::Button("EXPORT SEMUA", ImVec2(-1, 36))) exportAll(exportDir);
+      ImGui::EndTabItem();
+    }
+    ImGui::EndTabBar();
   }
-  if (ImGui::CollapsingHeader("Export PNG", ImGuiTreeNodeFlags_DefaultOpen)) {
-    ImGui::InputText("Folder", exportDir, sizeof(exportDir));
-    if (ImGui::Button("Export albedo/normal/rough/height/ao")) exportAll(exportDir);
-  }
+  tool = newTool;
   ImGui::Separator(); ImGui::TextWrapped("%s", status.c_str());
-  ImGui::Text("%.0f FPS", ImGui::GetIO().Framerate);
+  ImGui::TextDisabled("%.0f FPS", ImGui::GetIO().Framerate);
   ImGui::End();
 }
 
@@ -643,11 +786,12 @@ int main(int, char**) {
   bool running = true;
   while (running) {
     SDL_Event e;
-    while (SDL_PollEvent(&e)) { ImGui_ImplSDL2_ProcessEvent(&e); if (e.type == SDL_QUIT) running = false; }
+    while (SDL_PollEvent(&e)) { ImGui_ImplSDL2_ProcessEvent(&e); if (e.type == SDL_QUIT) running = false;
+      if (e.type == SDL_DROPFILE && e.drop.file) { dropPath = e.drop.file; SDL_free(e.drop.file); dropOpen = true; } }
     ImGui_ImplOpenGL3_NewFrame(); ImGui_ImplSDL2_NewFrame(); ImGui::NewFrame();
     ImGuiIO& io = ImGui::GetIO();
 
-    toolsUI();
+    toolsUI(); dropPopupUI();
     if (showNodes) nodeEditorUI(showNodes);
 
     if (!io.WantCaptureMouse) {

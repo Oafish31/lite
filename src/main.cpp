@@ -47,7 +47,8 @@ static int normalSrc = 0;               // 0 = node, 1 = hasil bake, 2 = file im
 static int albedoSrc = 0;               // 0 = node, 1 = file import
 static bool flipY = false;
 
-static const int PRES = 1024;
+static int PRES = 2048;   // resolusi layer paint & decal (bisa diganti di tab Texture)
+static int layerResIdx = 1;
 static std::vector<uint8_t> paintPx((size_t)PRES * PRES * 4, 0);
 static int pdy0 = PRES, pdy1 = -1;
 
@@ -71,7 +72,7 @@ uniform sampler2D uAlbedo; uniform sampler2D uNormal; uniform sampler2D uRough; 
 uniform vec3 uEye; uniform int uMode; uniform float uNStr; uniform int uUseAO;
 void main(){
   vec3 N=normalize(vN); vec3 T=normalize(vT-N*dot(N,vT)); vec3 B=cross(N,T);
-  vec3 nm=texture(uNormal,vUV).xyz*2.0-1.0; nm.xy*=uNStr; nm.xy+=(texture(uDecal,vUV).rg*255.0-128.0)/127.0;
+  vec3 nm=texture(uNormal,vUV).xyz*2.0-1.0; nm.xy*=uNStr; nm.xy+=texture(uDecal,vUV).rg;
   vec3 Nn=normalize(mat3(T,B,N)*nm);
   vec4 pa=texture(uPaint,vUV);
   vec3 alb=mix(texture(uAlbedo,vUV).rgb,pa.rgb,pa.a);
@@ -101,6 +102,7 @@ static GLuint makeTex() {
   GLuint t; glGenTextures(1, &t); glBindTexture(GL_TEXTURE_2D, t);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameterf(GL_TEXTURE_2D, 0x84FE, 8.0f);   // anisotropic filtering 8x (tajam di sudut miring)
   return t;
 }
 static void uploadTex(GLuint t, int w, int h, const void* data, bool mip) {
@@ -164,7 +166,7 @@ static int tool = 1; static bool eraser = false;
 static bool lastValid = false; static glm::vec2 lastUV;
 
 static void stamp(float u, float v) {
-  float cx = u * PRES, cy = v * PRES, r = brushSize;
+  float cx = u * PRES, cy = v * PRES, r = brushSize * PRES / 1024.f;
   int x0 = std::max(0, (int)(cx - r)), x1 = std::min(PRES - 1, (int)(cx + r));
   int y0 = std::max(0, (int)(cy - r)), y1 = std::min(PRES - 1, (int)(cy + r));
   for (int y = y0; y <= y1; y++) for (int x = x0; x <= x1; x++) {
@@ -215,7 +217,7 @@ static Pick pickSurface(const ImVec2& mp, const ImVec2& ds) {
 }
 static void paintAt(glm::vec2 uv) {
   if (lastValid && glm::length(uv - lastUV) < 0.25f) {
-    float step = std::max(1.f, brushSize * 0.25f) / PRES, d = glm::length(uv - lastUV);
+    float step = std::max(1.f / PRES, brushSize * 0.25f / 1024.f), d = glm::length(uv - lastUV);
     int n = (int)std::ceil(d / step);
     for (int i = 1; i <= n; i++) { glm::vec2 p = glm::mix(lastUV, uv, (float)i / n); stamp(p.x, p.y); }
   } else stamp(uv.x, uv.y);
@@ -224,67 +226,100 @@ static void paintAt(glm::vec2 uv) {
 
 
 // ===================== normal decal =====================
-struct Decal { std::string name; int w = 0, h = 0; std::vector<glm::vec3> n; std::vector<float> m; GLuint thumb = 0; };
+// Decal disimpan sebagai slope xy + mask, lengkap dengan mip-chain (supaya tidak aliasing / "bertitik" saat diperkecil)
+struct DecalLevel { int w = 0, h = 0; std::vector<glm::vec2> xy; std::vector<float> m; };
+struct Decal { std::string name; int w = 0, h = 0; std::vector<DecalLevel> lv; GLuint thumb = 0; };
 static std::vector<Decal> decals; static int decalSel = 0;
-static std::vector<uint8_t> decalPx((size_t)PRES * PRES * 4, 128);   // layer: rg = offset slope (128 = 0)
+static std::vector<float> decalPx((size_t)PRES * PRES * 2, 0.f);   // layer: rg = offset slope (float, presisi tinggi)
 static int ddy0 = PRES, ddy1 = -1; static bool decalUsed = false;
-static std::vector<std::vector<uint8_t>> decalUndo;
+static std::vector<std::vector<float>> decalUndo;
 static float decalSize = 0.08f, decalRot = 0.f, decalStrength = 1.f, decalOpac = 1.f; static bool decalInvert = false, decalRandom = false;
-static char decalPath[512] = ""; static int decalIsNormal = 1;
+static char decalPath[512] = ""; static int decalIsNormal = 1; static bool decalFlipY = false, decalFixBias = true;
 
 static float ssf(float a, float b, float x) { float t = glm::clamp((x - a) / (b - a), 0.f, 1.f); return t * t * (3 - 2 * t); }
 
-static void finishDecal(Decal& d, const std::vector<float>* H, float depth) {
-  if (H) {
-    d.n.resize((size_t)d.w * d.h);
-    auto G = [&](int x, int y) { x = glm::clamp(x, 0, d.w - 1); y = glm::clamp(y, 0, d.h - 1); return (*H)[(size_t)y * d.w + x]; };
-    for (int y = 0; y < d.h; y++) for (int x = 0; x < d.w; x++) {
-      float dx = (G(x + 1, y) - G(x - 1, y)) * d.w / 4.f * depth, dy = (G(x, y + 1) - G(x, y - 1)) * d.h / 4.f * depth;
-      d.n[(size_t)y * d.w + x] = glm::normalize(glm::vec3(-dx, -dy, 1.f));
+static DecalLevel halfLevel(const DecalLevel& s) {
+  DecalLevel r; r.w = std::max(1, s.w / 2); r.h = std::max(1, s.h / 2);
+  r.xy.resize((size_t)r.w * r.h); r.m.resize(r.xy.size());
+  for (int y = 0; y < r.h; y++) for (int x = 0; x < r.w; x++) {
+    float ms = 0; glm::vec2 a(0);
+    for (int dy = 0; dy < 2; dy++) for (int dx = 0; dx < 2; dx++) {
+      size_t i = (size_t)std::min(s.h - 1, y * 2 + dy) * s.w + std::min(s.w - 1, x * 2 + dx);
+      ms += s.m[i]; a += s.xy[i] * s.m[i];
     }
+    size_t o = (size_t)y * r.w + x; r.m[o] = ms * 0.25f; r.xy[o] = ms > 1e-6f ? a / ms : glm::vec2(0);
   }
-  std::vector<uint8_t> px((size_t)d.w * d.h * 4, 255);
-  for (size_t i = 0; i < d.n.size(); i++) {
-    glm::vec3 c = glm::mix(glm::vec3(.5f, .5f, 1.f), d.n[i] * 0.5f + 0.5f, d.m[i]);
+  return r;
+}
+static void heightToXY(const std::vector<float>& H, int w, int h, float depth, std::vector<glm::vec2>& xy) {
+  xy.resize((size_t)w * h);
+  auto G = [&](int x, int y) { x = glm::clamp(x, 0, w - 1); y = glm::clamp(y, 0, h - 1); return H[(size_t)y * w + x]; };
+  for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
+    float dx = (G(x + 1, y) - G(x - 1, y)) * w / 4.f * depth, dy = (G(x, y + 1) - G(x, y - 1)) * h / 4.f * depth;
+    glm::vec3 n = glm::normalize(glm::vec3(-dx, -dy, 1.f)); xy[(size_t)y * w + x] = glm::vec2(n.x, n.y);
+  }
+}
+static void finishDecalXY(Decal& d, DecalLevel&& base) {
+  while (base.w > 2048 || base.h > 2048) base = halfLevel(base);   // batasi memori
+  d.w = base.w; d.h = base.h; d.lv.clear(); d.lv.push_back(std::move(base));
+  while (d.lv.back().w > 1 || d.lv.back().h > 1) d.lv.push_back(halfLevel(d.lv.back()));
+  int ti = 0; while (ti + 1 < (int)d.lv.size() && d.lv[ti].w > 128) ti++;
+  const DecalLevel& T = d.lv[ti]; std::vector<uint8_t> px((size_t)T.w * T.h * 4, 255);
+  for (size_t i = 0; i < T.xy.size(); i++) {
+    glm::vec2 v = T.xy[i]; float z = std::sqrt(std::max(0.f, 1.f - glm::dot(v, v)));
+    glm::vec3 c = glm::mix(glm::vec3(.5f, .5f, 1.f), glm::vec3(v.x, v.y, z) * 0.5f + 0.5f, glm::clamp(T.m[i], 0.f, 1.f));
     for (int k = 0; k < 3; k++) px[i * 4 + k] = (uint8_t)(glm::clamp(c[k], 0.f, 1.f) * 255.f + .5f);
   }
-  d.thumb = makeTex(); uploadTex(d.thumb, d.w, d.h, px.data(), false);
+  d.thumb = makeTex(); uploadTex(d.thumb, T.w, T.h, px.data(), false);
   decals.push_back(std::move(d));
 }
 template <class F> static void procDecal(const char* name, float depth, F fn) {
-  Decal d; d.name = name; d.w = d.h = 128;
-  std::vector<float> H((size_t)128 * 128); d.m.resize(H.size());
-  for (int y = 0; y < 128; y++) for (int x = 0; x < 128; x++) {
-    float px = (x + .5f) / 64.f - 1.f, py = (y + .5f) / 64.f - 1.f, h, m;
-    fn(px, py, h, m); H[(size_t)y * 128 + x] = h; d.m[(size_t)y * 128 + x] = m;
+  Decal d; d.name = name; const int N = 256;
+  std::vector<float> H((size_t)N * N); DecalLevel L; L.w = L.h = N; L.m.resize(H.size());
+  for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) {
+    float px = (x + .5f) / (N / 2.f) - 1.f, py = (y + .5f) / (N / 2.f) - 1.f, h, m;
+    fn(px, py, h, m); H[(size_t)y * N + x] = h; L.m[(size_t)y * N + x] = m;
   }
-  finishDecal(d, &H, depth);
+  heightToXY(H, N, N, depth, L.xy); finishDecalXY(d, std::move(L));
 }
-static bool loadDecalPNG(const char* path, bool isNormal, std::string& err) {
+static bool loadDecalPNG(const char* path, bool isNormal, bool flipGreenY, std::string& err) {
   int w, h, c; stbi_set_flip_vertically_on_load(1);
   unsigned char* px = stbi_load(path, &w, &h, &c, 4); stbi_set_flip_vertically_on_load(0);
   if (!px) { err = std::string("Gagal load PNG: ") + path; return false; }
-  Decal d; d.name = std::filesystem::path(path).filename().string(); d.w = w; d.h = h;
-  size_t N = (size_t)w * h; d.m.assign(N, 1.f);
+  Decal d; d.name = std::filesystem::path(path).filename().string();
+  size_t N = (size_t)w * h; DecalLevel L; L.w = w; L.h = h; L.m.assign(N, 1.f); L.xy.assign(N, glm::vec2(0));
   bool anyAlpha = false; for (size_t i = 0; i < N; i++) if (px[i * 4 + 3] < 255) { anyAlpha = true; break; }
-  if (anyAlpha) for (size_t i = 0; i < N; i++) d.m[i] = px[i * 4 + 3] / 255.f;
+  if (anyAlpha) for (size_t i = 0; i < N; i++) L.m[i] = px[i * 4 + 3] / 255.f;
   if (isNormal) {
-    d.n.resize(N);
-    for (size_t i = 0; i < N; i++) {
-      glm::vec3 n(px[i * 4] / 127.5f - 1.f, px[i * 4 + 1] / 127.5f - 1.f, px[i * 4 + 2] / 127.5f - 1.f);
-      d.n[i] = glm::length(n) > 1e-4f ? glm::normalize(n) : glm::vec3(0, 0, 1);
+    // hanya pakai kanal R,G (slope). Kanal B diabaikan -> aman untuk normal map hasil render/tone-mapping yang birunya tidak 255
+    for (size_t i = 0; i < N; i++) { float x = px[i * 4] / 127.5f - 1.f, y = px[i * 4 + 1] / 127.5f - 1.f; L.xy[i] = glm::vec2(x, flipGreenY ? -y : y); }
+    if (decalFixBias) {   // buang kemiringan dasar (area datar tidak 128,128) pakai median
+      std::vector<float> xs, ys; size_t step = std::max<size_t>(1, N / 200000);
+      for (size_t i = 0; i < N; i += step) if (L.m[i] > 0.9f) { xs.push_back(L.xy[i].x); ys.push_back(L.xy[i].y); }
+      if (xs.size() > 16) {
+        std::nth_element(xs.begin(), xs.begin() + xs.size() / 2, xs.end()); std::nth_element(ys.begin(), ys.begin() + ys.size() / 2, ys.end());
+        glm::vec2 bias(xs[xs.size() / 2], ys[ys.size() / 2]);
+        for (size_t i = 0; i < N; i++) L.xy[i] -= bias;
+      }
     }
-    finishDecal(d, nullptr, 0);
   } else {
     std::vector<float> H(N);
     for (size_t i = 0; i < N; i++) H[i] = (0.299f * px[i * 4] + 0.587f * px[i * 4 + 1] + 0.114f * px[i * 4 + 2]) / 255.f;
-    finishDecal(d, &H, 0.3f);
+    heightToXY(H, w, h, 0.3f, L.xy);
   }
-  stbi_image_free(px); return true;
+  for (size_t i = 0; i < N; i++) {
+    if (L.m[i] <= 0.f) L.xy[i] = glm::vec2(0);
+    float len = glm::length(L.xy[i]); if (len > 0.98f) L.xy[i] *= 0.98f / len;
+  }
+  stbi_image_free(px); finishDecalXY(d, std::move(L)); return true;
+}
+static void uploadDecalFull() {
+  glBindTexture(GL_TEXTURE_2D, texDecal); glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RG16F, PRES, PRES, 0, GL_RG, GL_FLOAT, decalPx.data());
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 }
 static void initDecals() {
-  for (size_t i = 0; i < (size_t)PRES * PRES; i++) decalPx[i * 4 + 3] = 255;
-  texDecal = makeTex(); uploadTex(texDecal, PRES, PRES, decalPx.data(), false);
+  texDecal = makeTex(); uploadDecalFull();
   procDecal("Rivet", 0.35f, [](float x, float y, float& h, float& m) {
     float r = std::sqrt(x * x + y * y);
     h = r < 0.78f ? 0.8f * std::sqrt(1.f - (r / 0.78f) * (r / 0.78f)) : (r < 0.9f ? -0.25f : 0.f);
@@ -310,12 +345,24 @@ static void initDecals() {
   procDecal("Bump", 0.4f, [](float x, float y, float& h, float& m) {
     float r2 = x * x + y * y; h = std::exp(-r2 * 5.f); m = 1.f - ssf(0.7f, 1.f, std::sqrt(r2)); });
 }
-static void sampleDecal(const Decal& d, float sx, float sy, glm::vec3& n, float& m) {
-  sx = glm::clamp(sx, 0.f, (float)d.w - 1.001f); sy = glm::clamp(sy, 0.f, (float)d.h - 1.001f);
-  int x = (int)sx, y = (int)sy; float fx = sx - x, fy = sy - y;
-  auto I = [&](int xx, int yy) { return (size_t)yy * d.w + xx; };
-  n = glm::mix(glm::mix(d.n[I(x, y)], d.n[I(x + 1, y)], fx), glm::mix(d.n[I(x, y + 1)], d.n[I(x + 1, y + 1)], fx), fy);
-  m = glm::mix(glm::mix(d.m[I(x, y)], d.m[I(x + 1, y)], fx), glm::mix(d.m[I(x, y + 1)], d.m[I(x + 1, y + 1)], fx), fy);
+static void sampleLevel(const DecalLevel& L, float u, float v, glm::vec2& xy, float& m) {
+  float fx = glm::clamp(u * L.w - 0.5f, 0.f, (float)L.w - 1.f), fy = glm::clamp(v * L.h - 0.5f, 0.f, (float)L.h - 1.f);
+  int x = std::min((int)fx, L.w - 1), y = std::min((int)fy, L.h - 1), x1 = std::min(x + 1, L.w - 1), y1 = std::min(y + 1, L.h - 1);
+  float tx = fx - x, ty = fy - y;
+  size_t i[4] = {(size_t)y * L.w + x, (size_t)y * L.w + x1, (size_t)y1 * L.w + x, (size_t)y1 * L.w + x1};
+  float w[4] = {(1 - tx) * (1 - ty), tx * (1 - ty), (1 - tx) * ty, tx * ty};
+  glm::vec2 a(0); float ms = 0;
+  for (int k = 0; k < 4; k++) { ms += w[k] * L.m[i[k]]; a += w[k] * L.m[i[k]] * L.xy[i[k]]; }
+  m = ms; xy = ms > 1e-6f ? a / ms : glm::vec2(0);
+}
+// trilinear: pilih level mip sesuai ukuran texel tujuan -> tepi tipis tidak hilang / bertitik
+static void sampleDecal(const Decal& d, float u, float v, float lod, glm::vec2& xy, float& m) {
+  lod = glm::clamp(lod, 0.f, (float)d.lv.size() - 1.f);
+  int l0 = (int)lod, l1 = std::min(l0 + 1, (int)d.lv.size() - 1); float f = lod - l0;
+  glm::vec2 a, b; float ma, mb; sampleLevel(d.lv[l0], u, v, a, ma);
+  if (l1 == l0 || f < 1e-3f) { xy = a; m = ma; return; }
+  sampleLevel(d.lv[l1], u, v, b, mb);
+  float wa = ma * (1 - f), wb = mb * f; m = glm::mix(ma, mb, f); xy = (a * wa + b * wb) / std::max(wa + wb, 1e-6f);
 }
 static uint8_t encSlope(float v) { return (uint8_t)glm::clamp(v * 127.f + 128.5f, 0.f, 255.f); }
 // Proyeksi 3D: tiap texel UV dihitung posisi 3D-nya, lalu diproyeksikan ke bidang decal -> tembus seam UV dengan mulus
@@ -323,6 +370,8 @@ static void stampDecal(const Decal& d, const Pick& pk) {
   float halfW = lowDiag * decalSize * 0.5f, ang = glm::radians(decalRot);
   if (decalRandom) ang += (std::rand() / (float)RAND_MAX) * 6.2831853f;
   float c = std::cos(ang), s = std::sin(ang), sign = decalInvert ? -1.f : 1.f, R = halfW * 1.4143f;
+  float ws = 0.5f * (1.f / (PRES * pk.upw.x) + 1.f / (PRES * pk.upw.y));   // ukuran 1 texel layer di dunia
+  float lod = std::log2(std::max(1.f, (d.w / (2.f * halfW)) * ws));
   glm::vec3 N0 = pk.nrm, T0 = pk.tan - N0 * glm::dot(N0, pk.tan);
   T0 = glm::length(T0) > 1e-6f ? glm::normalize(T0) : glm::normalize(glm::cross(glm::vec3(0, 1, 0.01f), N0));
   glm::vec3 B0 = glm::cross(N0, T0), X = T0 * c + B0 * s, Y = B0 * c - T0 * s;
@@ -353,12 +402,12 @@ static void stampDecal(const Decal& d, const Pick& pk) {
       glm::vec3 ts = A.t * w0 + B.t * w1 + C.t * w2; ts = ts - ns * glm::dot(ns, ts);
       ts = glm::length(ts) > 1e-8f ? glm::normalize(ts) : glm::normalize(glm::cross(glm::vec3(0, 1, 0.01f), ns));
       glm::vec3 bs = glm::cross(ns, ts);
-      glm::vec3 n; float m; sampleDecal(d, (rx * .5f + .5f) * (d.w - 1), (ry * .5f + .5f) * (d.h - 1), n, m);
+      glm::vec2 n; float m; sampleDecal(d, rx * .5f + .5f, ry * .5f + .5f, lod, n, m);
       float k = m * face * (1.f - ssf(0.9f, 1.f, std::max(std::fabs(rx), std::fabs(ry)))) * (1.f - ssf(0.6f, 1.f, std::fabs(depth) / halfW))
                 * decalOpac * decalStrength * sign;
       glm::vec3 dn = (X * n.x + Y * n.y) * k;
-      uint8_t* p = &decalPx[((size_t)y * PRES + x) * 4];
-      p[0] = encSlope((p[0] - 128) / 127.f + glm::dot(dn, ts)); p[1] = encSlope((p[1] - 128) / 127.f + glm::dot(dn, bs));
+      float* p = &decalPx[((size_t)y * PRES + x) * 2];
+      p[0] = glm::clamp(p[0] + glm::dot(dn, ts), -4.f, 4.f); p[1] = glm::clamp(p[1] + glm::dot(dn, bs), -4.f, 4.f);
       done[(size_t)y * PRES + x] = 1; miny = std::min(miny, y); maxy = std::max(maxy, y);
     }
   }
@@ -366,7 +415,8 @@ static void stampDecal(const Decal& d, const Pick& pk) {
 }
 static void placeDecal(const Pick& pk) {
   if (decals.empty()) return;
-  if (decalUndo.size() >= 10) decalUndo.erase(decalUndo.begin());
+  size_t maxU = std::max<size_t>(1, std::min<size_t>(10, ((size_t)256 << 20) / (decalPx.size() * 4)));
+  while (decalUndo.size() >= maxU) decalUndo.erase(decalUndo.begin());
   decalUndo.push_back(decalPx);
   stampDecal(decals[decalSel], pk);
 }
@@ -375,14 +425,13 @@ static void undoDecal() {
   decalPx = decalUndo.back(); decalUndo.pop_back(); ddy0 = 0; ddy1 = PRES - 1;
 }
 static void clearDecals() {
-  decalUndo.clear(); std::fill(decalPx.begin(), decalPx.end(), 128);
-  for (size_t i = 0; i < (size_t)PRES * PRES; i++) decalPx[i * 4 + 3] = 255;
+  decalUndo.clear(); std::fill(decalPx.begin(), decalPx.end(), 0.f);
   ddy0 = 0; ddy1 = PRES - 1; decalUsed = false;
 }
 static void flushDecal() {
   if (ddy1 < ddy0) return;
   glBindTexture(GL_TEXTURE_2D, texDecal); glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, ddy0, PRES, ddy1 - ddy0 + 1, GL_RGBA, GL_UNSIGNED_BYTE, &decalPx[(size_t)ddy0 * PRES * 4]);
+  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, ddy0, PRES, ddy1 - ddy0 + 1, GL_RG, GL_FLOAT, &decalPx[(size_t)ddy0 * PRES * 2]);
   ddy0 = PRES; ddy1 = -1;
 }
 
@@ -441,8 +490,8 @@ static bool exportNormal(const std::string& dir) {
   int W = std::max(bw, PRES), H = std::max(bh, PRES); std::vector<uint8_t> out((size_t)W * H * 4, 255);
   parallelFor(H, [&](int y) {
     for (int x = 0; x < W; x++) {
-      size_t bi = ((size_t)(y * bh / H) * bw + (x * bw / W)) * 4, di = ((size_t)(y * PRES / H) * PRES + (x * PRES / W)) * 4, o = ((size_t)y * W + x) * 4;
-      glm::vec3 n(base[bi] / 127.5f - 1.f + (decalPx[di] - 128) / 127.f, base[bi + 1] / 127.5f - 1.f + (decalPx[di + 1] - 128) / 127.f, base[bi + 2] / 127.5f - 1.f);
+      size_t bi = ((size_t)(y * bh / H) * bw + (x * bw / W)) * 4, di = ((size_t)(y * PRES / H) * PRES + (x * PRES / W)) * 2, o = ((size_t)y * W + x) * 4;
+      glm::vec3 n(base[bi] / 127.5f - 1.f + decalPx[di], base[bi + 1] / 127.5f - 1.f + decalPx[di + 1], base[bi + 2] / 127.5f - 1.f);
       n = glm::normalize(n) * 0.5f + 0.5f;
       for (int k = 0; k < 3; k++) out[o + k] = (uint8_t)(glm::clamp(n[k], 0.f, 1.f) * 255.f + .5f);
     }
@@ -551,6 +600,14 @@ static void nodeEditorUI(bool& open) {
   ImGui::End();
 }
 
+static void setLayerRes(int r) {
+  PRES = r;
+  paintPx.assign((size_t)r * r * 4, 0); decalPx.assign((size_t)r * r * 2, 0.f);
+  decalUndo.clear(); decalUsed = false; lastValid = false;
+  pdy0 = PRES; pdy1 = -1; ddy0 = PRES; ddy1 = -1;
+  uploadTex(texPaint, PRES, PRES, paintPx.data(), false); uploadDecalFull();
+  status = "Resolusi layer paint/decal = " + std::to_string(r) + " (paint & decal di-reset)";
+}
 // ===================== import & UI =====================
 static int viewMode = 0; static bool wire = false, showNodes = true; static char exportDir[512] = "export";
 static std::string lowName = "Sphere", highName, impNormalName, impAlbedoName;
@@ -613,7 +670,7 @@ static void importAlbedo(const std::string& p) {
 }
 static void importDecal(const std::string& p, bool isNormal) {
   std::string err;
-  if (loadDecalPNG(p.c_str(), isNormal, err)) { decalSel = (int)decals.size() - 1; status = "Decal dimuat: " + decals.back().name; }
+  if (loadDecalPNG(p.c_str(), isNormal, decalFlipY, err)) { decalSel = (int)decals.size() - 1; status = "Decal dimuat: " + decals.back().name; }
   else status = err;
 }
 
@@ -675,6 +732,9 @@ static void toolsUI() {
       ImGui::TextWrapped("Atur texture lewat Node Editor (klik kanan = tambah node).");
       if (ImGui::Combo("Resolusi", &texResIdx, "256\0" "512\0" "1024\0" "2048\0")) dirty = true;
       if (ImGui::SliderFloat("Normal strength", &normStrength, 0.f, 30.f)) dirty = true;
+      ImGui::SeparatorText("Kualitas layer Paint & Decal");
+      if (ImGui::Combo("Resolusi layer", &layerResIdx, "1024\0" "2048\0" "4096\0")) setLayerRes(1024 << layerResIdx);
+      ImGui::TextDisabled("Makin tinggi makin tajam saat zoom dekat (reset paint/decal).");
       ImGui::SeparatorText("Sumber map di model");
       if (ImGui::Combo("Normal", &normalSrc, "Dari Node\0Hasil Bake\0File Import\0")) applyNormalTex();
       if (ImGui::Combo("Albedo", &albedoSrc, "Dari Node\0File Import\0")) applyAlbedoTex();
@@ -709,6 +769,7 @@ static void toolsUI() {
       ImGui::Checkbox("Inverse", &decalInvert); ImGui::SameLine(); ImGui::Checkbox("Rotasi acak", &decalRandom);
       if (ImGui::Button("Undo")) undoDecal(); ImGui::SameLine(); if (ImGui::Button("Hapus semua decal")) clearDecals();
       ImGui::SeparatorText("Decal sendiri");
+      ImGui::Checkbox("DirectX (flip Y)", &decalFlipY); ImGui::SameLine(); ImGui::Checkbox("Auto-koreksi tilt", &decalFixBias);
       ImGui::RadioButton("Normal map", &decalIsNormal, 1); ImGui::SameLine(); ImGui::RadioButton("Height/grayscale", &decalIsNormal, 0);
       if (ImGui::Button("Buka PNG decal...", ImVec2(-1, 0)) && browse(FILT_IMG, p)) importDecal(p, decalIsNormal != 0);
       ImGui::EndTabItem();
